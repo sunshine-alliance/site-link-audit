@@ -48,6 +48,17 @@ TIMEOUT = 20          # seconds per request
 DELAY = 0.3           # politeness pause between page fetches
 DEFAULT_MAX_PAGES = 500
 
+# Anti-bot codes: many big sites (Yelp, LinkedIn, Instagram, Cloudflare-fronted
+# sites) refuse automated requests. A response in this set means "the server
+# refused the crawler", NOT "the page is dead" -- so for EXTERNAL links we report
+# these as Blocked / unverifiable rather than broken, to avoid false positives.
+BLOCKED_CODES = {401, 403, 405, 429, 503, 999}
+
+# <link rel="..."> values that are RESOURCE HINTS, not navigable links. Their href
+# is frequently a bare origin (e.g. https://fonts.googleapis.com/) that 404s while
+# the hint works perfectly -- the browser only uses the hostname. Never check these.
+HINT_RELS = {"dns-prefetch", "preconnect", "preload", "prefetch", "prerender", "modulepreload"}
+
 SKIP_SCHEMES = ("mailto:", "tel:", "javascript:", "data:", "sms:", "ftp:", "file:")
 RESOURCE_EXTS = (
     ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico",
@@ -131,8 +142,10 @@ def extract_links(soup, page_url):
     for img in soup.find_all("img", src=True):
         yield img["src"], (img.get("alt") or "")[:120], "img"
     for link in soup.find_all("link", href=True):
-        rel = " ".join(link.get("rel", []))
-        yield link["href"], rel[:120], "link"
+        rels = [r.lower() for r in (link.get("rel") or [])]
+        if any(r in HINT_RELS for r in rels):
+            continue  # resource hint (dns-prefetch/preconnect/...), not a real link
+        yield link["href"], " ".join(rels)[:120], "link"
     for s in soup.find_all("script", src=True):
         yield s["src"], "", "script"
 
@@ -201,6 +214,9 @@ def crawl(seed, max_pages):
 
             ltype = classify(target, base_host)
             st = check_url(target, session)
+            # An external link that refuses the bot (403/429/etc.) is "blocked",
+            # not broken -- the page is almost certainly fine for real visitors.
+            blocked = (ltype == "external" and st["code"] in BLOCKED_CODES)
 
             link_records.append({
                 "source": page,
@@ -210,6 +226,7 @@ def crawl(seed, max_pages):
                 "type": ltype,
                 "code": st["code"],
                 "ok": st["ok"],
+                "blocked": blocked,
                 "reason": st["reason"],
                 "final_url": st["final_url"] if st["final_url"] != target else "",
             })
@@ -247,10 +264,15 @@ def autosize(ws, widths):
 
 
 def write_report(out_path, seed, base_host, max_pages):
-    broken = [r for r in link_records if not r["ok"]]
+    # "Blocked" = external links that refused the crawler (anti-bot 403/429/...).
+    # Reported separately; they do NOT count as broken (the page is almost always
+    # fine for real visitors).
+    blocked = [r for r in link_records if r.get("blocked")]
+    broken = [r for r in link_records if not r["ok"] and not r.get("blocked")]
     # Dedup broken by (source, target) so the same nav link on every page
     # is not counted dozens of times in the headline figure.
     uniq_broken_pairs = {(r["source"], r["target"]) for r in broken}
+    uniq_blocked_targets = {r["target"] for r in blocked}
 
     n_pages = len(pages_crawled)
     n_pages_broken = sum(1 for p in pages_crawled if not p["ok"])
@@ -286,6 +308,8 @@ def write_report(out_path, seed, base_host, max_pages):
         ("BROKEN - internal resources (img/css/js/pdf)", b_resource),
         ("BROKEN - external links", b_external),
         ("Unique broken links (page + target)", len(uniq_broken_pairs)),
+        ("", ""),
+        ("Blocked / unverifiable external (anti-bot - usually fine)", len(uniq_blocked_targets)),
     ]
     r0 = 4
     for i, (label, val) in enumerate(rows):
@@ -326,6 +350,40 @@ def write_report(out_path, seed, base_host, max_pages):
             name="Arial", bold=True, size=11, color="2E7D32")
     autosize(ws, [42, 46, 26, 16, 8, 34, 36])
 
+    # ---- Tab: Blocked / Verify Manually ----
+    ws = wb.create_sheet("Blocked - Verify")
+    ws.sheet_view.showGridLines = False
+    note = ("These EXTERNAL links refused the automated crawler (e.g. 403 / 429). "
+            "That is almost always anti-bot protection (Yelp, social sites, "
+            "Cloudflare), NOT a dead link - they work for real visitors. "
+            "Spot-check any you do not recognize.")
+    ws.cell(row=1, column=1, value=note).font = Font(name="Arial", italic=True, size=9, color=NAVY)
+    headers = ["Blocked link URL", "Example page it's on", "Appears on N pages",
+               "Status", "Reason"]
+    for c, h in enumerate(headers, 1):
+        ws.cell(row=3, column=c, value=h)
+    style_header(ws, len(headers), row=3)
+    ws.freeze_panes = "A4"
+    if blocked:
+        counts, example = {}, {}
+        for r in blocked:
+            counts[r["target"]] = counts.get(r["target"], 0) + 1
+            example.setdefault(r["target"], r)
+        for i, (tgt, n) in enumerate(sorted(counts.items(), key=lambda kv: -kv[1]), start=4):
+            r = example[tgt]
+            vals = [tgt, r["source"], n,
+                    r["code"] if r["code"] is not None else "ERR", r["reason"]]
+            for c, v in enumerate(vals, 1):
+                cell = ws.cell(row=i, column=c, value=v)
+                cell.font = Font(name="Arial", size=9)
+                cell.alignment = Alignment(vertical="top", wrap_text=(c in (1, 2, 5)))
+                cell.fill = PatternFill("solid", fgColor="FFF3CD")  # light amber
+                cell.border = BORDER
+    else:
+        ws.cell(row=4, column=1, value="No blocked links - every external link verified cleanly.").font = Font(
+            name="Arial", bold=True, size=11, color="2E7D32")
+    autosize(ws, [50, 42, 16, 8, 30])
+
     # ---- Tab 3: All Links ----
     ws = wb.create_sheet("All Links")
     ws.sheet_view.showGridLines = False
@@ -336,15 +394,18 @@ def write_report(out_path, seed, base_host, max_pages):
     style_header(ws, len(headers))
     ws.freeze_panes = "A2"
     for i, r in enumerate(sorted(link_records, key=lambda r: (r["source"], r["target"])), start=2):
+        ok_txt = "blocked" if r.get("blocked") else ("yes" if r["ok"] else "NO")
         vals = [r["source"], r["target"], r["anchor"], r["tag"], r["type"],
                 r["code"] if r["code"] is not None else "ERR",
-                "yes" if r["ok"] else "NO", r["reason"], r["final_url"]]
+                ok_txt, r["reason"], r["final_url"]]
         for c, v in enumerate(vals, 1):
             cell = ws.cell(row=i, column=c, value=v)
             cell.font = Font(name="Arial", size=9)
             cell.alignment = Alignment(vertical="top", wrap_text=(c in (1, 2)))
             cell.border = BORDER
-            if not r["ok"]:
+            if r.get("blocked"):
+                cell.fill = PatternFill("solid", fgColor="FFF3CD")  # amber, not red
+            elif not r["ok"]:
                 cell.fill = PatternFill("solid", fgColor=LIGHT_RED)
             elif i % 2 == 0:
                 cell.fill = PatternFill("solid", fgColor=LIGHT_GREY)
@@ -374,6 +435,7 @@ def write_report(out_path, seed, base_host, max_pages):
     return {
         "pages": n_pages, "links": n_links,
         "broken_unique": len(uniq_broken_pairs),
+        "blocked_unique": len(uniq_blocked_targets),
         "b_internal": b_internal, "b_resource": b_resource, "b_external": b_external,
     }
 
@@ -405,6 +467,7 @@ def main():
     print("  internal pages     :", summary["b_internal"])
     print("  internal resources :", summary["b_resource"])
     print("  external links     :", summary["b_external"])
+    print("Blocked (anti-bot)   :", summary["blocked_unique"])
     print("Report written       :", args.out)
     print("-" * 64)
 
