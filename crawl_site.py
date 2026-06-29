@@ -147,9 +147,10 @@ def crawl(seed, max_pages):
 
     while to_crawl and len(pages_crawled) < max_pages:
         page = to_crawl.popleft()
-        page_status = check_url(page, session)
 
-        # Fetch the page body so we can parse it for more links.
+        # Fetch the page body once: this single GET both gives us the page's own
+        # status AND the HTML to parse for more links. (A prior check_url(page)
+        # HEAD here was redundant - it was always overwritten by this GET.)
         html, content_type = None, ""
         try:
             r = session.get(page, allow_redirects=True, timeout=TIMEOUT)
